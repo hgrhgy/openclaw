@@ -58,6 +58,56 @@ export type AgentAcpBinding = {
 
 export type AgentBinding = AgentRouteBinding | AgentAcpBinding;
 
+/**
+ * A single routing rule used by a router agent.
+ *
+ * Rules are evaluated in order; the first matching rule wins.
+ * A rule matches when either `keywords` or `pattern` produces a match.
+ */
+export type RouterAgentRule = {
+  /** Target agent ID to dispatch the message to. */
+  agentId: string;
+  /** Human-readable display name for the agent (falls back to agentId). */
+  name?: string;
+  /**
+   * Case-insensitive keywords — if **any** keyword appears in the message
+   * the rule matches.
+   */
+  keywords?: string[];
+  /**
+   * JavaScript-compatible regular expression string.
+   * Tested against the full message with the `i` flag.
+   * Invalid patterns are silently skipped.
+   */
+  pattern?: string;
+};
+
+/**
+ * Configuration for the router/dispatcher mode of an agent.
+ *
+ * When `enabled: true`, the agent acts as a lightweight job-submission
+ * router: it immediately replies to the IM with a task ID and the name of
+ * the downstream agent that will handle the request, then dispatches the
+ * message asynchronously to that agent.
+ *
+ * Users can query task status by sending `status <taskId>` or
+ * `tasks <agentId>` to the router agent.
+ */
+export type RouterAgentConfig = {
+  /** Must be `true` to activate router mode. */
+  enabled: true;
+  /**
+   * Ordered list of routing rules.  The first rule whose `keywords` or
+   * `pattern` matches the inbound message determines the target agent.
+   */
+  rules?: RouterAgentRule[];
+  /**
+   * Fallback agent ID used when no rule matches.
+   * If omitted and no rule matches the router replies with an error.
+   */
+  defaultAgentId?: string;
+};
+
 export type AgentConfig = {
   id: string;
   default?: boolean;
@@ -87,6 +137,14 @@ export type AgentConfig = {
   tools?: AgentToolsConfig;
   /** Optional runtime descriptor for this agent. */
   runtime?: AgentRuntimeConfig;
+  /**
+   * Router/dispatcher configuration.
+   *
+   * When set, this agent acts as a job-submission router rather than a
+   * regular LLM agent: it immediately replies with a task ID and dispatches
+   * the message to the appropriate downstream agent.
+   */
+  router?: RouterAgentConfig;
 };
 
 export type AgentsConfig = {

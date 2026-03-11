@@ -5,11 +5,42 @@ read_when:
   - "You need to install Node.js before installing OpenClaw"
   - "You installed OpenClaw but `openclaw` is command not found"
   - "npm install -g fails with permissions or PATH issues"
+  - "You want to know which directory npm installs OpenClaw into"
 ---
 
 # Node.js
 
 OpenClaw requires **Node 22 or newer**. The [installer script](/install#install-methods) will detect and install Node automatically — this page is for when you want to set up Node yourself and make sure everything is wired up correctly (versions, PATH, global installs).
+
+## Installation directory
+
+When you run `npm install -g openclaw`, npm places the package under its **global prefix**:
+
+| Platform      | Package files                                    | `openclaw` binary                |
+| ------------- | ------------------------------------------------ | -------------------------------- |
+| macOS / Linux | `$(npm prefix -g)/lib/node_modules/openclaw/`    | `$(npm prefix -g)/bin/openclaw`  |
+| Windows       | `%APPDATA%\npm\node_modules\openclaw\`           | `%APPDATA%\npm\openclaw.cmd`     |
+
+Run `npm prefix -g` to see the exact prefix on your machine.
+
+<Tabs>
+  <Tab title="install-cli.sh">
+    Uses a **local prefix** (default `~/.openclaw`) so no root access is needed:
+
+    - Package files: `~/.openclaw/lib/node_modules/openclaw/`
+    - Binary wrapper: `~/.openclaw/bin/openclaw`
+
+    Pass `--prefix <path>` to change the location.
+  </Tab>
+  <Tab title="git install">
+    Clones the repo and places a wrapper script at:
+
+    - macOS / Linux: `~/.local/bin/openclaw`
+    - Windows: `%USERPROFILE%\.local\bin\openclaw.cmd`
+
+    The repository itself lives in `~/openclaw` by default (configurable with `--git-dir`).
+  </Tab>
+</Tabs>
 
 ## Check your version
 

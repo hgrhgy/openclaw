@@ -1,4 +1,4 @@
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
+import { resolveAgentConfig, resolveSessionAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
   loadSessionStore,
@@ -23,6 +23,16 @@ import {
   logSessionStateChange,
 } from "../../logging/diagnostic.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { jobStore } from "../../routing/job-store.js";
+import {
+  formatAgentTasksReply,
+  formatAllTasksReply,
+  formatJobStatusReply,
+  formatTaskAcceptedReply,
+  formatTaskNotFoundReply,
+  parseRouterStatusQuery,
+  resolveRouterTarget,
+} from "../../routing/router-agent.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { maybeApplyTtsToPayload, normalizeTtsAutoMode, resolveTtsConfig } from "../../tts/tts.js";
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
@@ -35,6 +45,7 @@ import { shouldSkipDuplicateInbound } from "./inbound-dedupe.js";
 import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
 import { shouldSuppressReasoningPayload } from "./reply-payloads.js";
 import { isRoutableChannel, routeReply } from "./route-reply.js";
+import { dispatchToRouterTarget } from "./router-agent-dispatch.js";
 import { resolveRunTypingPolicy } from "./typing-policy.js";
 
 const AUDIO_PLACEHOLDER_RE = /^<media:audio>(\s*\([^)]*\))?$/i;
@@ -103,6 +114,97 @@ export type DispatchFromConfigResult = {
   queuedFinal: boolean;
   counts: Record<ReplyDispatchKind, number>;
 };
+
+/**
+ * Handle a message addressed to a router agent.
+ *
+ * - If the message is a status query (`status <id>`, `tasks <agentId>`, …),
+ *   reply immediately with the job information.
+ * - Otherwise, submit a new job: reply immediately with the task ID + agent
+ *   name, then fire-and-forget the actual dispatch to the target agent.
+ */
+async function handleRouterAgentMessage(params: {
+  ctx: FinalizedMsgContext;
+  cfg: OpenClawConfig;
+  dispatcher: ReplyDispatcher;
+  routerConfig: NonNullable<NonNullable<ReturnType<typeof resolveAgentConfig>>["router"]>;
+  shouldRouteToOriginating: boolean;
+  originatingChannel?: string;
+  originatingTo?: string;
+  isGroup: boolean;
+  groupId?: string;
+}): Promise<DispatchFromConfigResult> {
+  const { ctx, cfg, dispatcher, routerConfig } = params;
+  const message = (ctx.Body ?? "").trim();
+
+  const sendReply = async (text: string): Promise<boolean> => {
+    const payload: ReplyPayload = { text };
+    if (params.shouldRouteToOriginating && params.originatingChannel && params.originatingTo) {
+      const result = await routeReply({
+        payload,
+        channel: params.originatingChannel,
+        to: params.originatingTo,
+        sessionKey: ctx.SessionKey,
+        accountId: ctx.AccountId,
+        threadId: ctx.MessageThreadId,
+        cfg,
+        isGroup: params.isGroup,
+        groupId: params.groupId,
+      });
+      if (!result.ok) {
+        logVerbose(`router-agent: route-reply failed: ${result.error ?? "unknown error"}`);
+      }
+      return result.ok;
+    }
+    return dispatcher.sendFinalReply(payload);
+  };
+
+  // ── Status queries ───────────────────────────────────────────────────────
+  const statusQuery = parseRouterStatusQuery(message);
+  if (statusQuery) {
+    let replyText: string;
+    if (statusQuery.type === "status") {
+      const job = jobStore.getByTaskId(statusQuery.taskId);
+      replyText = job ? formatJobStatusReply(job) : formatTaskNotFoundReply(statusQuery.taskId);
+    } else if (statusQuery.type === "tasks") {
+      const jobs = jobStore.getByAgentId(statusQuery.agentId);
+      replyText = formatAgentTasksReply({ agentId: statusQuery.agentId, tasks: jobs });
+    } else {
+      replyText = formatAllTasksReply(jobStore.listAll());
+    }
+    const queuedFinal = await sendReply(replyText);
+    return { queuedFinal, counts: dispatcher.getQueuedCounts() };
+  }
+
+  // ── Route new task ───────────────────────────────────────────────────────
+  const target = resolveRouterTarget({ cfg, routerConfig, message });
+  if (!target) {
+    const queuedFinal = await sendReply(
+      "⚠️ Router: no downstream agent configured for this message. " +
+        "Please check the `router.rules` and `router.defaultAgentId` settings.",
+    );
+    return { queuedFinal, counts: dispatcher.getQueuedCounts() };
+  }
+
+  // Submit the job and send the immediate confirmation
+  const job = jobStore.submit({
+    agentId: target.agentId,
+    agentName: target.agentName,
+    userMessage: message,
+  });
+
+  const replyText = formatTaskAcceptedReply({
+    taskId: job.taskId,
+    agentId: target.agentId,
+    agentName: target.agentName,
+  });
+  const queuedFinal = await sendReply(replyText);
+
+  // Fire-and-forget: dispatch to the target agent
+  void dispatchToRouterTarget({ ctx, target, taskId: job.taskId });
+
+  return { queuedFinal, counts: dispatcher.getQueuedCounts() };
+}
 
 export async function dispatchReplyFromConfig(params: {
   ctx: FinalizedMsgContext;
@@ -275,6 +377,30 @@ export async function dispatchReplyFromConfig(params: {
   markProcessing();
 
   try {
+    // ── Router agent: intercept before any LLM processing ─────────────────
+    const sessionKey = ctx.SessionKey;
+    if (sessionKey) {
+      const routerAgentId = resolveSessionAgentId({ sessionKey, config: cfg });
+      const routerCfg = resolveAgentConfig(cfg, routerAgentId);
+      if (routerCfg?.router?.enabled) {
+        const routerResult = await handleRouterAgentMessage({
+          ctx,
+          cfg,
+          dispatcher,
+          routerConfig: routerCfg.router,
+          shouldRouteToOriginating,
+          originatingChannel: originatingChannel ?? undefined,
+          originatingTo,
+          isGroup,
+          groupId: groupId ?? undefined,
+        });
+        recordProcessed("completed", { reason: "router_agent" });
+        markIdle("message_completed");
+        return routerResult;
+      }
+    }
+    // ── End router agent check ─────────────────────────────────────────────
+
     const fastAbort = await tryFastAbortFromMessage({ ctx, cfg });
     if (fastAbort.handled) {
       const payload = {
